@@ -1,105 +1,203 @@
-def compare_forecast_methods(series: np.ndarray) -> dict:
-    """Compara todos los métodos de pronóstico y selecciona el mejor."""
-    if len(series) < 3:
-        return {
-            "best_method": "promedio",
-            "best_params": {},
-            "forecast": np.mean(series) if len(series) > 0 else 0,
-            "metrics": {"promedio": {"mape": 0, "rmse": 0, "mae": 0}}
-        }
+# -*- coding: utf-8 -*-
+"""
+logic.py - Lógica completa
+"""
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Utilidades generales
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    if text is None:
+        return ""
+    text = str(text).strip().lower()
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return text
+
+STOCK_ALIASES = {
+    "codigo": ["codigo", "cod", "sku", "item"],
+    "descripcion": ["descripcion", "desc", "nombre"],
+    "familia": ["familia", "categoria", "grupo"],
+    "unidad": ["unidad de medida", "u m", "um", "unidad"],
+    "stock_actual": ["stock actual", "stock", "cantidad", "existencia"],
+}
+
+SALIDAS_ALIASES = {
+    "codigo": STOCK_ALIASES["codigo"],
+    "descripcion": STOCK_ALIASES["descripcion"],
+    "familia": STOCK_ALIASES["familia"],
+    "unidad": STOCK_ALIASES["unidad"],
+    "fecha": ["fecha", "fecha salida", "date"],
+    "cantidad_salida": ["cantidad salida", "cantidad", "salida", "qty"],
+}
+
+def _find_column(columns, aliases):
+    norm_map = {_normalize(c): c for c in columns}
+    for alias in aliases:
+        na = _normalize(alias)
+        if na in norm_map:
+            return norm_map[na]
+        for norm_col, real_col in norm_map.items():
+            if na and (na in norm_col or norm_col in na):
+                return real_col
+    return None
+
+def detect_columns(df: pd.DataFrame, kind: str):
+    aliases = STOCK_ALIASES if kind == "stock" else SALIDAS_ALIASES
+    result = {}
+    for field, alist in aliases.items():
+        result[field] = _find_column(df.columns, alist)
+    return result
+
+def rename_to_standard(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    rename = {v: k for k, v in mapping.items() if v is not None}
+    return df.rename(columns=rename)
+
+# ---------------------------------------------------------------------------
+# Carga de archivos
+# ---------------------------------------------------------------------------
+
+def load_stock_file(file) -> pd.DataFrame:
+    df = pd.read_excel(file, dtype={"Código": str, "codigo": str})
+    df.columns = [str(c).strip() for c in df.columns]
+    mapping = detect_columns(df, "stock")
+    df = rename_to_standard(df, mapping)
     
-    n = len(series)
-    train_size = int(n * 0.8)
-    train = series[:train_size]
-    test = series[train_size:]
+    missing = [f for f in ["codigo", "stock_actual"] if f not in df.columns]
+    if missing:
+        raise ValueError(
+            "No se pudieron identificar las columnas obligatorias en el archivo de Stock: " + ", ".join(missing)
+        )
     
-    if len(test) < 1:
-        train = series
-        test = series[-2:]
+    for opt in ["descripcion", "familia", "unidad"]:
+        if opt not in df.columns:
+            df[opt] = np.nan
+
+    df["codigo"] = df["codigo"].astype(str).str.strip()
+    df["stock_actual"] = pd.to_numeric(df["stock_actual"], errors="coerce")
+    df["descripcion"] = df["descripcion"].astype(str).str.strip()
+    df["familia"] = df["familia"].astype(str).str.strip()
+    df["unidad"] = df["unidad"].astype(str).str.strip().str.upper()
     
-    methods = {}
+    df.loc[df["descripcion"].isin(["nan", "None", ""]), "descripcion"] = np.nan
+    df.loc[df["familia"].isin(["nan", "None", ""]), "familia"] = np.nan
+    df.loc[df["unidad"].isin(["NAN", "NONE", ""]), "unidad"] = np.nan
     
-    # 1. Promedio
-    forecast_mean = np.mean(train)
-    methods["promedio"] = {
-        "forecast": forecast_mean,
-        "params": {},
-        "mape": _calculate_mape(test, forecast_mean),
-        "rmse": _calculate_rmse(test, forecast_mean),
-        "mae": _calculate_mae(test, forecast_mean)
-    }
+    return df[["codigo", "descripcion", "familia", "unidad", "stock_actual"]]
+
+def load_salidas_file(file) -> pd.DataFrame:
+    df = pd.read_excel(file, dtype={"Código": str, "codigo": str})
+    df.columns = [str(c).strip() for c in df.columns]
+    mapping = detect_columns(df, "salidas")
+    df = rename_to_standard(df, mapping)
     
-    # 2. SES
-    best_ses = {"mape": float("inf"), "params": {}, "forecast": 0}
-    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-        forecast_ses = _forecast_ses(train, alpha)
-        mape = _calculate_mape(test, forecast_ses)
-        if mape < best_ses["mape"]:
-            best_ses = {
-                "mape": mape,
-                "params": {"alpha": alpha},
-                "forecast": forecast_ses,
-                "rmse": _calculate_rmse(test, forecast_ses),
-                "mae": _calculate_mae(test, forecast_ses)
-            }
-    methods["ses"] = best_ses
+    missing = [f for f in ["codigo", "fecha", "cantidad_salida"] if f not in df.columns]
+    if missing:
+        raise ValueError(
+            "No se pudieron identificar las columnas obligatorias en el archivo de Salidas: " + ", ".join(missing)
+        )
     
-    # 3. Holt
-    best_holt = {"mape": float("inf"), "params": {}, "forecast": 0}
-    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5]:
-        for beta in [0.05, 0.1, 0.2, 0.3]:
-            try:
-                forecast_holt = _forecast_holt(train, alpha, beta)
-                mape = _calculate_mape(test, forecast_holt)
-                if mape < best_holt["mape"]:
-                    best_holt = {
-                        "mape": mape,
-                        "params": {"alpha": alpha, "beta": beta},
-                        "forecast": forecast_holt,
-                        "rmse": _calculate_rmse(test, forecast_holt),
-                        "mae": _calculate_mae(test, forecast_holt)
-                    }
-            except:
-                continue
-    methods["holt"] = best_holt
+    for opt in ["descripcion", "familia", "unidad"]:
+        if opt not in df.columns:
+            df[opt] = np.nan
+
+    df["codigo"] = df["codigo"].astype(str).str.strip()
+    df["fecha_original"] = df["fecha"]
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce", dayfirst=True)
+    df["cantidad_salida"] = pd.to_numeric(df["cantidad_salida"], errors="coerce")
+    df["descripcion"] = df["descripcion"].astype(str).str.strip()
+    df["familia"] = df["familia"].astype(str).str.strip()
+    df["unidad"] = df["unidad"].astype(str).str.strip().str.upper()
     
-    # 4. Holt-Winters
-    if len(series) >= 12:
-        best_hw = {"mape": float("inf"), "params": {}, "forecast": 0}
-        for alpha in [0.1, 0.2, 0.3, 0.4, 0.5]:
-            for beta in [0.05, 0.1, 0.2, 0.3]:
-                for gamma in [0.05, 0.1, 0.2]:
-                    for seasonality in [12, 6, 3]:
-                        try:
-                            forecast_hw = _forecast_hw(train, alpha, beta, gamma, seasonality)
-                            mape = _calculate_mape(test, forecast_hw)
-                            if mape < best_hw["mape"]:
-                                best_hw = {
-                                    "mape": mape,
-                                    "params": {
-                                        "alpha": alpha, "beta": beta,
-                                        "gamma": gamma, "seasonality": seasonality
-                                    },
-                                    "forecast": forecast_hw,
-                                    "rmse": _calculate_rmse(test, forecast_hw),
-                                    "mae": _calculate_mae(test, forecast_hw)
-                                }
-                        except:
-                            continue
-        methods["hw"] = best_hw
+    df.loc[df["descripcion"].isin(["nan", "None", ""]), "descripcion"] = np.nan
+    df.loc[df["familia"].isin(["nan", "None", ""]), "familia"] = np.nan
+    df.loc[df["unidad"].isin(["NAN", "NONE", ""]), "unidad"] = np.nan
     
-    best_method = min(methods.keys(), key=lambda m: methods[m]["mape"])
-    
-    return {
-        "best_method": best_method,
-        "best_params": methods[best_method]["params"],
-        "forecast": methods[best_method]["forecast"],
-        "metrics": {
-            m: {
-                "mape": methods[m]["mape"],
-                "rmse": methods[m]["rmse"],
-                "mae": methods[m]["mae"]
-            }
-            for m in methods
-        }
-    }
+    return df[["codigo", "descripcion", "familia", "unidad", "fecha", "fecha_original", "cantidad_salida"]]
+
+# ---------------------------------------------------------------------------
+# Validación de datos
+# ---------------------------------------------------------------------------
+
+def validate_data(stock_df: pd.DataFrame, salidas_df: pd.DataFrame) -> dict:
+    issues = {}
+    codigos_stock = set(stock_df["codigo"].dropna().unique())
+    codigos_salidas = set(salidas_df["codigo"].dropna().unique())
+
+    sin_salidas = sorted(codigos_stock - codigos_salidas)
+    issues["stock_sin_salidas"] = stock_df[stock_df["codigo"].isin(sin_salidas)][
+        ["codigo", "descripcion", "familia", "unidad", "stock_actual"]
+    ].drop_duplicates()
+
+    sin_stock = sorted(codigos_salidas - codigos_stock)
+    issues["salidas_sin_stock"] = salidas_df[salidas_df["codigo"].isin(sin_stock)][
+        ["codigo", "descripcion", "familia", "unidad"]
+    ].drop_duplicates()
+
+    dup_mask = stock_df["codigo"].duplicated(keep=False)
+    issues["codigos_duplicados"] = stock_df[dup_mask].sort_values("codigo")
+
+    issues["sin_descripcion"] = stock_df[stock_df["descripcion"].isna()][
+        ["codigo", "familia", "unidad"]
+    ].drop_duplicates()
+
+    issues["sin_familia"] = stock_df[stock_df["familia"].isna()][
+        ["codigo", "descripcion", "unidad"]
+    ].drop_duplicates()
+
+    issues["sin_unidad"] = stock_df[stock_df["unidad"].isna()][
+        ["codigo", "descripcion", "familia"]
+    ].drop_duplicates()
+
+    fam_stock = stock_df.dropna(subset=["familia"])[["codigo", "familia"]].drop_duplicates()
+    fam_sal = salidas_df.dropna(subset=["familia"])[["codigo", "familia"]].drop_duplicates()
+    merged_fam = fam_stock.merge(fam_sal, on="codigo", suffixes=("_stock", "_salidas"))
+    issues["diferencia_familia"] = merged_fam[
+        merged_fam["familia_stock"] != merged_fam["familia_salidas"]
+    ]
+
+    um_stock = stock_df.dropna(subset=["unidad"])[["codigo", "unidad"]].drop_duplicates()
+    um_sal = salidas_df.dropna(subset=["unidad"])[["codigo", "unidad"]].drop_duplicates()
+    merged_um = um_stock.merge(um_sal, on="codigo", suffixes=("_stock", "_salidas"))
+    issues["diferencia_unidad"] = merged_um[
+        merged_um["unidad_stock"] != merged_um["unidad_salidas"]
+    ]
+
+    issues["stock_vacio"] = stock_df[stock_df["stock_actual"].isna()][
+        ["codigo", "descripcion", "familia", "unidad"]
+    ]
+
+    issues["fechas_incorrectas"] = salidas_df[salidas_df["fecha"].isna()][
+        ["codigo", "descripcion", "fecha_original"]
+    ].rename(columns={"fecha_original": "valor_original"})
+
+    cant_invalidas = salidas_df[
+        salidas_df["cantidad_salida"].isna() | (salidas_df["cantidad_salida"] < 0)
+    ]
+    issues["cantidades_invalidas"] = cant_invalidas[["codigo", "descripcion", "fecha", "cantidad_salida"]]
+
+    codigos_rotura = salidas_df[
+        salidas_df["codigo"].isin(stock_df[stock_df["stock_actual"] <= 0]["codigo"])
+    ]["codigo"].unique()
+    issues["rotura_stock"] = stock_df[stock_df["codigo"].isin(codigos_rotura)][
+        ["codigo", "descripcion", "familia", "unidad", "stock_actual"]
+    ]
+
+    issues["stock_negativo"] = stock_df[stock_df["stock_actual"] < 0][
+        ["codigo", "descripcion", "familia", "unidad", "stock_actual"]
+    ]
+
+    total_issues = sum(len(v) for v in issues.values())
+    issues["_total"] = total_issues
+    return issues
+
+# ---------------------------------------------------------------------------
+# Build monthly consumption (Stub)
+# ---------------------------------------------------------------------------
+def build_monthly_consumption(salidas_df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame()
